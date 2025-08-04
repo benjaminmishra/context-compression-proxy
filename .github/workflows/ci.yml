@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@v1
       - name: Deploy to Fly.io
-        run: flyctl deploy --image ghcr.io/${{ github.repository }}:${{ github.sha }} --remote-only
+        run: flyctl deploy --app ${{ secrets.FLY_APP_NAME }} --image ghcr.io/${{ github.repository }}:${{ github.sha }} --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       - name: Smoke test
