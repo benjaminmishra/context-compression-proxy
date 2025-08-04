@@ -1,14 +1,14 @@
 from functools import lru_cache
 from typing import Dict
 
-from pydantic import BaseSettings, Field, validator
+from pydantic import BaseSettings, Field
 
 
 class Settings(BaseSettings):
     """Application configuration loaded from environment variables."""
 
-    # Mapping of API token -> username
-    user_tokens: Dict[str, str] = Field(default_factory=dict)
+    # Raw mapping provided via env var, e.g. "token:user,token2:user2"
+    user_tokens_raw: str = Field("", env="CCP_USER_TOKENS")
 
     # Simple per-minute request limit per token
     rate_limit_per_minute: int = 60
@@ -17,16 +17,14 @@ class Settings(BaseSettings):
     openai_api_base: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
 
-    @validator("user_tokens", pre=True)
-    def parse_user_tokens(cls, v: str | Dict[str, str]) -> Dict[str, str]:
-        if isinstance(v, str):
-            tokens: Dict[str, str] = {}
-            if v:
-                for pair in v.split(","):
-                    token, user = pair.split(":", 1)
-                    tokens[token.strip()] = user.strip()
-            return tokens
-        return v
+    @property
+    def user_tokens(self) -> Dict[str, str]:
+        tokens: Dict[str, str] = {}
+        if self.user_tokens_raw:
+            for pair in self.user_tokens_raw.split(","):
+                token, user = pair.split(":", 1)
+                tokens[token.strip()] = user.strip()
+        return tokens
 
     class Config:
         env_prefix = "CCP_"

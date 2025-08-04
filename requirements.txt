@@ -1,6 +1,7 @@
+build
 fastapi
 httpx
-pydantic
+pydantic<2
 prometheus-client
 pytest
 uvicorn
