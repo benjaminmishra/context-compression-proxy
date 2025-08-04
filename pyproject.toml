@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "context-compression-proxy"
+version = "0.1.0"
+description = "Context Compression Proxy"
+authors = [{name = "CCP Dev"}]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "httpx",
+    "pydantic<2",
+    "prometheus-client",
+    "uvicorn",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["proxy*"]
