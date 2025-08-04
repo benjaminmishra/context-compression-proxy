@@ -1,134 +1,139 @@
-# Context‑Compression Proxy – Production Requirements & Implementation Plan
-
-> **Goal**: Deliver a revenue‑ready, token‑saving proxy that transparently front‑ends any OpenAI‑compatible `/v1/chat/completions` endpoint by compressing conversational context with a QR‑HEAD retriever.
-
----
-
-## 1 Scope
-
-* **In** : Single‑tenant SaaS MVP (one GPU node) plus metered billing.
-* **Out**: Multi‑GPU sharding, enterprise SSO, on‑prem installer.
-
-## 2 User Stories (dev‑centric)
-
-1. *As a developer* I point my SDK at `https://api.ccproxy.ai` instead of `https://api.openai.com` and add `X‑API‑Key`, and my bill drops by ≥ 40 %.
-2. *As an account owner* I can query `/usage` and see tokens‑before, tokens‑after, and savings.
-3. *As ops* I get a Slack alert if p99 latency > 5 s or GPU memory > 90 %.
-
-## 3 Service‑level targets
-
-| Metric                                          | Target     |
-| ----------------------------------------------- | ---------- |
-| p95 end‑to‑end latency (non‑streaming, 1 k ctx) | ≤ 1 .5 s   |
-| Availability                                    | ≥ 99.5 %   |
-| Token‑savings accuracy                          | ± 2 tokens |
+# Context‑Compression Proxy – Detailed SaaS Requirements (v2)
+*Updated 04 Aug 2025*
 
 ---
-
-## 4 Tech Stack (locked)
-
-| Layer         | Choice                             | Why                |
-| ------------- | ---------------------------------- | ------------------ |
-| Runtime       | Python 3.10, FastAPI               | async + type hints |
-| Model lib     | 🤗 Transformers v4.43 + PEFT v0.10 | LoRA support       |
-| Base model    | `mistralai/Mistral‑7B‑v0.2` int4   | ≤ 24 GB VRAM       |
-| GPU           | NVIDIA A10 / 24 GB                 | cheap spot         |
-| Data          | Supabase (Postgres 15)             | auth + usage rows  |
-| Billing       | Stripe Usage Records               | metered            |
-| Infra         | Fly.io Machines (autoscale)        | zero‑ops GPU       |
-| Observability | Prometheus OTLP → Grafana Cloud    | free tier          |
+## 0 Vision
+Create a **drop‑in HTTP proxy** that slashes LLM token spend ≥ 40 % for developers by compressing chat context on the fly.  The service must be:
+* **Self‑serve** (signup → API key in < 60 s)
+* **Metered & billable** (Stripe usage‑based plans)
+* **Low‑latency** (p95 ≤ 1.5 s for 1 k‑token requests)
+* **Secure & compliant** (SOC 2‑ready foundations)
 
 ---
+## 1 Functional Requirements
+### 1.1 API
+| Route | Verb | Purpose | Auth |
+|-------|------|---------|------|
+| `/v1/chat/completions` | POST | OpenAI‑compatible; compresses context then forwards upstream | `X‑API‑Key` (required) |
+| `/usage` | GET | Returns JSON of hourly token_in / token_out / savings | JWT (user) |
+| `/keys` | POST/DELETE | Create or revoke API keys | JWT (user) |
+| `/healthz` | GET | Liveness & model/device info | none |
+| `/metrics` | GET | Prometheus exposition | token (internal) |
 
-## 5 System Components & Files
+### 1.2 User management
+* Email‑magic‑link signup (no passwords) via **Supabase Auth**.
+* Each account may create multiple **API keys** (stored hashed, argon2id).
+* Roles: `user`, `admin` (admin can view other users, plan limits).
+* Monthly plan attributes: `token_quota`, `qps_limit`, `model_whitelist`.
 
+### 1.3 Rate limiting & quotas
+* **Soft limit**: Redis Leaky‑Bucket per key (`tokens_in`).
+
+* **Hard limit**: Load‑balancer level (Cloudflare) ‑ 300 req/min per IP.
+* Over‑quota response → **HTTP 429** with JSON `{error:{type:"quota_exceeded"}}`.
+
+### 1.4 Billing
+* Usage row written **per request**: `(account_id, ts_hour, tokens_in, tokens_out)`.
+* Nightly cron aggregates into `usage_daily`, pushes **Stripe Usage Record**.
+* Plans: *Hobby*, *Pro*, *Team*, *Enterprise* – metered overages.
+
+### 1.5 Admin ops
+* `/admin/dashboard` (behind Cloudflare Access) shows real‑time QPS, GPU %, top customers, error logs.
+* CLI script `ccproxy admin ban <api_key>` immediately disables key via Redis set.
+
+---
+## 2 Non‑Functional Requirements
+| Category | Target / practice |
+|----------|------------------|
+| **Performance** | p95 latency ≤ 1.5 s (1 k ctx non‑stream); throughput ≥ 15 req/s per A10. |
+| **Availability** | ≥ 99.5 % monthly, multi‑AZ GPU standby; health probes every 15 s. |
+| **Scalability** | Horizontal pod autoscale when GPU util > 70 % for 2 min. |
+| **Security** | All transit TLS 1.3; HSTS; secrets via Fly.io machines; OWASP top‑10 scans monthly. |
+| **Privacy** | No user content persisted > 24 h; logs redact message bodies. |
+| **Observability** | Prom metrics + Loki JSON logs; dashboards for latency, error rate, token saved. |
+| **Compliance readiness** | Audit trails (who created key, when); data‑retention configs; GDPR‑delete endpoint. |
+| **Disaster recovery** | Postgres point‑in‑time restore; daily S3 snapshot of LoRA weights & DB. |
+| **CI/CD** | Push → lint/test → Docker build → staging → canary 5 % traffic → prod promote. |
+
+---
+## 3 System Design
+### 3.1 Services & containers
+1. **Edge (LB + WAF)** – Cloudflare → handles TLS, IP‑level rate‑limit.
+2. **API Gateway** – Small FastAPI pod (CPU) for auth, JWT, and key checks; forwards to GPU pod.
+3. **GPU Worker** – FastAPI + Transformers; keeps model & LoRA in memory; exposes `/chat`, `/metrics`.
+4. **Jobs Container** – Celery beat worker for nightly billing, email digests.
+5. **Postgres** – Supabase db_micro; stores users, keys, usage.
+6. **Redis** – Fly.io Redis‑lite for rate‑limit counters and key cache.
+
+### 3.2 Data model (Postgres)
+```sql
+CREATE TABLE accounts (
+  id uuid PRIMARY KEY,
+  email text UNIQUE NOT NULL,
+  tier text NOT NULL DEFAULT 'hobby',
+  created_at timestamptz DEFAULT now()
+);
+CREATE TABLE api_keys (
+  key_hash text PRIMARY KEY,
+  account_id uuid REFERENCES accounts(id),
+  created_at timestamptz DEFAULT now(),
+  revoked boolean DEFAULT false
+);
+CREATE TABLE usage_hourly (
+  account_id uuid,
+  ts_hour timestamptz,
+  tokens_in bigint,
+  tokens_out bigint,
+  PRIMARY KEY(account_id, ts_hour)
+);
 ```
-repo/
- ├── proxy/
- │   ├── main.py            # FastAPI app (canvas code)
- │   ├── qr_retriever.py    # condense_context helper
- │   ├── metrics.py         # Prom + loguru config
- │   └── settings.py        # Pydantic‑based env loader
- ├── docker/
- │   └── Dockerfile
- ├── charts/                # Optional Helm chart
- ├── tests/
- │   ├── unit/              # pytest
- │   └── load/              # k6 scripts
- ├── scripts/
- │   └── train_qr_lora.py   # QR‑HEAD fine‑tune driver
- ├── ci/
- │   └── github‑workflow.yml
- └── README.md
-```
 
-### Key modules
+### 3.3 Sequence diagram (request path)
+1. **Client** → `api.ccproxy.ai` with `X-API-Key`, JSON chat payload.
+2. Cloudflare authenticates & rate‑limits.
+3. API Gateway:
 
-* **`settings.py`** – centralised env var parsing, default fallbacks.
-* **`qr_retriever.py`** – loads model & LoRA once (`@lru_cache`), exposes `reduce(query, context) -> str`.
-* **`main.py`** – routes:
+   * verifies key (Redis), checks quota.
+4. Gateway forwards to **GPU Worker** internal URL.
+5. GPU Worker:
 
-  * `POST /v1/chat/completions`
-  * `GET  /healthz`
-  * `GET  /metrics` (Prom)
-* **`metrics.py`** – counters: `tokens_in_total`, `tokens_saved_total`, `req_latency_seconds` histogram.
+   * condenses context → calls upstream LLM → returns answer & savings headers.
+6. Gateway records `(tokens_in, tokens_out)` to Redis stream.
+7. Response propagated back to client.
+8. Background job flushes Redis stream to `usage_hourly` every minute.
 
 ---
-
-## 6 Dev → Prod Pipeline
-
-| Step                 | Tool           | Outcome                               |
-| -------------------- | -------------- | ------------------------------------- |
-| **1** Push to `main` | GitHub Actions | lint + mypy + tests                   |
-| **2** Build          | Docker         | image `ghcr.io/you/ccproxy:<sha>`     |
-| **3** Deploy         | Flyctl         | rolling restart with health probe     |
-| **4** Smoke‑test     | curl in CI     | assert 20 %+ token savings on fixture |
-
-Scripts in `ci/github‑workflow.yml` handle all four.
-
----
-
-## 7 Implementation Milestones
-
-| W‑end | Ticket                         | File(s)                  | Definition of Done                        |
-| ----- | ------------------------------ | ------------------------ | ----------------------------------------- |
-| 1     | 🚧 `settings.py`, health route | `main.py`, `settings.py` | `GET /healthz` → 200                      |
-| 1     | Load model + retriever         | `qr_retriever.py`        | `pytest tests/unit/test_reduce.py` passes |
-| 2     | Core proxy logic               | `main.py`                | `tokens_saved > 0` in local run           |
-| 2     | Dockerfile build               | `docker/Dockerfile`      | `docker run ... /healthz`=ok              |
-| 3     | Prom metrics                   | `metrics.py`             | `/metrics` exposé prom family             |
-| 3     | Basic auth & API key           | `main.py` + DB stub      | 401 on missing key                        |
-| 4     | Usage logging                  | DB migrations            | hourly totals row inserted                |
-| 4     | Stripe integration             | `billing_job.py`         | invoice created in test mode              |
-| 5     | Grafana alerts                 | cloud console            | alert fires on fake high latency          |
-| 6     | Demo site & docs               | `docs/`, `static/`       | live token‑savings gif                    |
+## 4 Implementation Roadmap (code‑wise)
+| Milestone | Tasks | PR files |
+|-----------|-------|----------|
+| **M0 Init** | Repo scaffold, `settings.py`, Dockerfile, health route | main.py, docker/ |
+| **M1 Retrieval** | QR retriever util + unit tests | qr_retriever.py, tests/ |
+| **M2 Proxy logic** | `/v1/chat/completions`, upstream client stub, token headers | main.py |
+| **M3 Auth & keys** | Supabase SDK, `X‑API-Key` middleware, key CRUD routes | auth.py, db.py |
+| **M4 Rate‑limit** | Redis leaky bucket, global error handler 429 | ratelimit.py |
+| **M5 Usage & Stripe** | Redis → Postgres flusher job, Stripe usage record cron | billing.py |
+| **M6 Observability** | metrics.py, Grafana JSON dashboards, alert rules | metrics.py, charts/ |
+| **M7 Docs & demo** | `/demo` static page, README gif, Postman collection | docs/, static/ |
 
 ---
-
-## 8 Acceptance Tests (excerpt)
-
-1. **Compression ratio** – Given `20 k`‑token input, compressed output ≤ `4 k` tokens.
-2. **Accuracy parity** – Answers using compressed context differ < 5 Levenshtein dist vs. full‑context baseline on 100 prompts.
-3. **Throughput** – Sustains ≥ 15 req/s with p95 < 2 s on `A10`.
-4. **Token counter** – `x‑tokens-before` − `x‑tokens-after` = `x‑tokens-saved`.
-5. **Billing** – Stripe invoice matches `tokens_after * price_per_token`.
-
----
-
-## 9 Security & Privacy Notes
-
-* No context stored long‑term; logs redact user message text.
-* All env secrets pulled from Fly.io secrets store; no plaintext in repo.
-* `/metrics` protected by static token; disable in production if needed.
+## 5 Risk & Mitigations
+| Risk | Mitigation |
+|------|-----------|
+| GPU spot pre‑emption | Warm standby pod in second region; automatic reattach of volume cache. |
+| LoRA corruption | Versioned uploads to S3 (R2); checksum on start. |
+| Abuse / jailbreak prompts | Optional OpenAI moderation call before compression; plan to upsell “Safe‑mode”. |
+| Quota accounting drift | Hourly flush + nightly reconciliation vs. Prom counters. |
 
 ---
-
-## 10 Next‑phase Nice‑to‑Haves
-
-* Multi‑GPU horizontal scale (vLLM back‑end).
-* “Lossless mode” that appends a pointer to full context for citation.
-* Admin panel for per‑user savings chart.
+## 6 Definition of “Production Ready”
+* All milestone M0–M6 merged to **main**, CI green.
+* p95 latency, availability, token‑savings acceptance tests pass for 3 days.
+* On‑call alerting routed (PagerDuty/free tier) with runbooks in `/ops`.
+* First paying customer live on **Pro** tier with Stripe charge succeeded.
 
 ---
-
-*Document version 1.0 — 04 Aug 2025*
+## 7 Next‑Step Upgrades (post‑launch)
+1. **Org accounts + RBAC**
+2. **Bring‑your‑own‑model** via vLLM plugin
+3. **Edge GPU caching** using NVIDIA HGX instances
+4. **HIPAA log redaction bucket** with client‑side encryption
