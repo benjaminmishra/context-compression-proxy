@@ -1,0 +1,10 @@
+version: '3.9'
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    environment:
+      CCP_USER_TOKENS: dev-token:dev
+    ports:
+      - "8000:8000"
